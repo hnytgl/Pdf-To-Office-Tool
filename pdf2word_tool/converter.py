@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .excel_extractor import extract_best_tables
+
 OUTPUT_SUFFIXES = {
     "word": ".docx",
     "docx": ".docx",
@@ -175,6 +177,7 @@ def convert_excel(job: ConversionJob, start_page: int | None = None, end_page: i
     try:
         import openpyxl
         import pdfplumber
+        from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
     except Exception as exc:
         return ConversionResult(job.source, job.target, "failed", f"未安装 Excel 转换依赖：{exc}")
 
@@ -182,6 +185,15 @@ def convert_excel(job: ConversionJob, start_page: int | None = None, end_page: i
         workbook = openpyxl.Workbook()
         default_sheet = workbook.active
         workbook.remove(default_sheet)
+        audit_rows: list[tuple[int, str, int, float]] = []
+
+        def write_literal_cell(worksheet, row: int, column: int, value: object) -> None:
+            cleaned = ILLEGAL_CHARACTERS_RE.sub("", str(value))
+            cell = worksheet.cell(row=row, column=column, value=cleaned)
+            # Keep PDF content literal: values such as "=1+1" are data,
+            # not formulas to execute when the workbook is opened.
+            cell.data_type = "s"
+
         with pdfplumber.open(job.source) as pdf:
             first_page = start_page or 1
             last_page = end_page or len(pdf.pages)
@@ -191,24 +203,39 @@ def convert_excel(job: ConversionJob, start_page: int | None = None, end_page: i
 
             for index, page in enumerate(selected_pages, start=first_page):
                 worksheet = workbook.create_sheet(title=f"第{index}页")
-                tables = page.extract_tables()
+                extraction = extract_best_tables(page)
+                tables = extraction.tables
+                audit_rows.append((index, extraction.strategy, extraction.stamp_objects_removed, extraction.score))
                 row_index = 1
                 if tables:
                     for table in tables:
                         for row in table:
                             for col_index, value in enumerate(row, start=1):
-                                worksheet.cell(row=row_index, column=col_index, value=value)
+                                if value is None:
+                                    continue
+                                write_literal_cell(worksheet, row_index, col_index, value)
                             row_index += 1
                         row_index += 1
                 else:
                     text = page.extract_text() or ""
                     for line in text.splitlines():
-                        worksheet.cell(row=row_index, column=1, value=line)
+                        write_literal_cell(worksheet, row_index, 1, line)
                         row_index += 1
                     if not text:
                         worksheet.cell(row=1, column=1, value="该页未提取到文本或表格")
 
-        workbook.save(job.target)
+        audit = workbook.create_sheet(title="_转换报告")
+        audit.append(["页码", "提取策略", "已忽略疑似印章对象数", "质量评分"])
+        for audit_row in audit_rows:
+            audit.append(audit_row)
+        audit.sheet_state = "hidden"
+
+        temporary_target = job.target.with_name(f".{job.target.name}.tmp")
+        try:
+            workbook.save(temporary_target)
+            temporary_target.replace(job.target)
+        finally:
+            temporary_target.unlink(missing_ok=True)
     except Exception as exc:
         return ConversionResult(job.source, job.target, "failed", str(exc))
 
